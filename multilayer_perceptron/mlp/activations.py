@@ -31,3 +31,14 @@ class LinearActivation(ActivationFunction):
 
     def deriv(self, x: nptypes.NDArray) -> nptypes.NDArray:
         return np.ones(x.shape)
+
+
+class SoftmaxActivation(ActivationFunction):
+
+    def val(self, x: nptypes.NDArray) -> nptypes.NDArray:
+        exp = np.exp(x)
+        return exp / np.sum(exp, axis=1).reshape(-1, 1)
+
+    def deriv(self, x: nptypes.NDArray) -> nptypes.NDArray:
+        return np.ones(x.shape)  # it works with cross-entropy
+
