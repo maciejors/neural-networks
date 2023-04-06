@@ -1,45 +1,116 @@
 from typing import Callable
 
 import numpy as np
-import numpy.typing as nptypes
+from numpy.typing import NDArray
 from numpy.random import Generator, PCG64
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from .activations import ActivationFunction
-from .lossfunc import LossFunction
+from .activations import ActivationFunction, ReLUActivation, SigmoidActivation, TanhActivation
+from .lossfunc_and_metrics import LossFunction
+from .optimisers import Optimiser, MomentumGD
+
+
+def _get_rng(seed: int | str | None) -> Generator:
+    if seed is not None:
+        if type(seed) is str:
+            seed = np.sum([ord(c) for c in seed])
+        rng = Generator(PCG64(seed))
+    else:
+        rng = Generator(PCG64())
+    return rng
+
+
+def _generate_batches(x: NDArray, y: NDArray, batch_size: int,
+                      rng: Generator) -> tuple[list[NDArray], list[NDArray]]:
+    data_size = y.shape[0]
+    # shuffle x & y
+    indices = np.arange(data_size)
+    rng.shuffle(indices)
+    x = x[indices]
+    y = y[indices]
+    # generate batches
+    split_points = np.arange(batch_size, data_size, batch_size)
+    x_batches = np.array_split(x, split_points)
+    y_batches = np.array_split(y, split_points)
+    return x_batches, y_batches
 
 
 class MLP:
     __slots__ = ['input_size', 'output_size', 'hidden_layers_sizes', 'weights', 'biases',
-                 'activation_func', 'out_func',
-                 'loss', '__normalise_max_x', '__normalise_min_x', '__normalise_max_y',
-                 '__normalise_min_y']
+                 'activation_func', 'out_func', 'loss', 'eval_metric',
+                 '__normalise_max_x', '__normalise_min_x', '__normalise_max_y', '__normalise_min_y']
 
     def __init__(self, input_size: int, hidden_layers_sizes: list[int], output_size: int,
                  activation_func: ActivationFunction, out_func: ActivationFunction,
-                 loss: LossFunction):
+                 loss: LossFunction, eval_metric: Callable = None, weights_init_method: str = None):
+        """
+        :param input_size:          dimension of the input
+        :param hidden_layers_sizes: sizes of the hidden layers passed as a list (e.g. [10, 10])
+        :param output_size:         dimension of the output
+        :param activation_func:     activation function for all the layers except the last one
+        :param out_func:            activation function for the last layer
+        :param loss:                a loss function optimised during training
+        :param eval_metric:         a metric used to evaluate the model
+        :param weights_init_method: a method to use to initialise weights. Possible values:
+                                    "default", "xavier", "he". Default means the weights will be
+                                    initialised from the uniform distribution on a [0, 1] interval.
+                                    If set to None, the method will be inferred from the used
+                                    activation function ("he" for ReLU, "xavier" for sigmoid or
+                                    tanh, "default" otherwise)
+        """
         self.input_size = input_size
         self.hidden_layers_sizes = hidden_layers_sizes
         self.output_size = output_size
         self.activation_func = activation_func
         self.out_func = out_func
         self.loss = loss
-        self.__set_default_weights()
+        # default eval metric will be a loss function
+        if eval_metric is None:
+            eval_metric = loss.val
+        self.eval_metric = eval_metric
 
-    def __set_default_weights(self, rng: Generator = None):
+        self.weights = []
+        self.biases = []
+        self.__set_default_weights(method=weights_init_method)
+
+        # default normalisation values mean 'no normalisation':
+        self.__normalise_min_x = 0
+        self.__normalise_max_x = 1
+        self.__normalise_min_y = 0
+        self.__normalise_max_y = 1
+
+    def __set_default_weights(self, method: str = None, rng: Generator = None):
         self.weights = []
         self.biases = []
 
         if rng is None:
             rng = Generator(PCG64())
+        if method is None:
+            if self.activation_func is ReLUActivation:
+                method = 'he'
+            elif self.activation_func is SigmoidActivation or \
+                    self.activation_func is TanhActivation:
+                method = 'xavier'
+            else:
+                method = 'default'
 
         # default weigths are taken from normal distribution
         layers_sizes = [self.input_size, *self.hidden_layers_sizes, self.output_size]
         for i in range(len(layers_sizes) - 1):
-            self.weights.append(
-                rng.uniform(size=(layers_sizes[i], layers_sizes[i + 1]))
-            )
+            shape = (layers_sizes[i], layers_sizes[i + 1])
+
+            if method == 'xavier':
+                xavier_boundary = 1 / np.sqrt(shape[0])
+                new_weights = rng.uniform(low=-xavier_boundary, high=xavier_boundary, size=shape)
+            elif method == 'he':
+                new_weights = rng.normal(scale=np.sqrt(2 / shape[0]), size=shape)
+            else:
+                # uniform [0, 1] distribution by default
+                new_weights = rng.uniform(size=shape)
+
+            self.weights.append(new_weights)
+
         # default biases are 0
         for layer_size in layers_sizes[1:]:
             self.biases.append(
@@ -51,6 +122,15 @@ class MLP:
         return len(self.weights) + 1
 
     def visualise(self, nrow: int = None, ncol: int = None, annotate: bool = True):
+        """
+        Visualises weights and biases using heatmaps (weights and biases from a single layer
+        are concatenated to make the visualisation more condensed)
+
+        :param nrow:     number of heatmaps per column
+        :param ncol:     number of heatmaps per row
+        :param annotate: whether to add numerical values of weights and biases on top of every box
+                         on a heatmap
+        """
         if ncol is None and nrow is None:
             nrow = 1
             ncol = self.layers_count - 1
@@ -76,57 +156,35 @@ class MLP:
             plt.title(plot_title)
         plt.show()
 
-    def __normalise_x(self, x: nptypes.NDArray) -> nptypes.NDArray:
+    def __normalise_x(self, x: NDArray) -> NDArray:
         return (x - self.__normalise_min_x) / (self.__normalise_max_x - self.__normalise_min_x)
 
-    def __normalise_y(self, y: nptypes.NDArray) -> nptypes.NDArray:
+    def __normalise_y(self, y: NDArray) -> NDArray:
         return (y - self.__normalise_min_y) / (self.__normalise_max_y - self.__normalise_min_y)
 
-    def __denormalise_x(self, x: nptypes.NDArray) -> nptypes.NDArray:
+    def __denormalise_x(self, x: NDArray) -> NDArray:
         return x * (self.__normalise_max_x - self.__normalise_min_x) + self.__normalise_min_x
 
-    def __denormalise_y(self, y: nptypes.NDArray) -> nptypes.NDArray:
+    def __denormalise_y(self, y: NDArray) -> NDArray:
         return y * (self.__normalise_max_y - self.__normalise_min_y) + self.__normalise_min_y
 
-    def __get_rng(self, seed: int | str | None) -> Generator:
-        if seed is not None:
-            if type(seed) is str:
-                seed = np.sum([ord(c) for c in seed])
-            rng = Generator(PCG64(seed))
-        else:
-            rng = Generator(PCG64())
-        return rng
-
-    def __generate_batches(self, x: nptypes.NDArray, y: nptypes.NDArray, batch_size: int,
-                           rng: Generator) -> list[tuple[nptypes.NDArray, nptypes.NDArray]]:
-        data_size = y.shape[0]
-        # shuffle x & y
-        indices = np.arange(data_size)
-        rng.shuffle(indices)
-        x = x[indices]
-        y = y[indices]
-        # generate batches
-        split_points = np.arange(batch_size, data_size, batch_size)
-        x_batches = np.array_split(x, split_points)
-        y_batches = np.array_split(y, split_points)
-        return x_batches, y_batches
-
     def __handle_verbosity(self, verbosity_period: int, epoch: int, total_epochs: int,
-                           x_train_pre_norm: nptypes.NDArray, y_train_pre_norm: nptypes.NDArray,
-                           x_test: nptypes.NDArray, y_test: nptypes.NDArray):
-        # printing the progress every [verbosity_period]th epoch, unless verbosity_period is set to 0
+                           x_train_pre_norm: NDArray, y_train_pre_norm: NDArray,
+                           x_test: NDArray, y_test: NDArray):
+        # printing the progress every [verbosity_period]th epoch
+        # unless verbosity_period is set to 0
         if verbosity_period > 0 and (epoch + 1) % verbosity_period == 0:
 
-            loss_train = self.loss.val(y_train_pre_norm, self.predict(x_train_pre_norm))
-            text = f'Epoch {epoch + 1}/{total_epochs} done | loss(train) = {loss_train:.2f}'
+            metric_train = self.eval_metric(y_train_pre_norm, self.predict(x_train_pre_norm))
+            text = f'Epoch {epoch + 1}/{total_epochs} done | ' \
+                   f'eval_metric(train) = {metric_train:.2f}'
 
             if x_test is not None and y_test is not None:
-                loss_test = self.loss.val(y_test, self.predict(x_test))
-                text += f' | loss(test) = {loss_test:.2f}'
+                metric_test = self.eval_metric(y_test, self.predict(x_test))
+                text += f' | eval_metric(test) = {metric_test:.2f}'
             print(text)
 
-    def __feedforward(self, x: nptypes.NDArray) -> tuple[
-        list[nptypes.NDArray], list[nptypes.NDArray]]:
+    def __feedforward(self, x: NDArray) -> tuple[list[NDArray], list[NDArray]]:
         """
         Computes and returns the values in every layer from before and after activation
 
@@ -149,10 +207,8 @@ class MLP:
         a.append(prev_a)
         return z, a
 
-    def __backpropagate(self, y: nptypes.NDArray,
-                        z: list[nptypes.NDArray],
-                        a: list[nptypes.NDArray]) -> tuple[
-        list[nptypes.NDArray], list[nptypes.NDArray]]:
+    def __backpropagate(self, y: NDArray, z: list[NDArray], a: list[NDArray]) \
+            -> tuple[list[NDArray], list[NDArray]]:
         """
         Performs backpropagation and returns weights and biases deltas
 
@@ -176,219 +232,55 @@ class MLP:
 
         return weights_delta, biases_delta
 
-    def __summarise_training(self, loss_history: list[float], plot_loss: bool):
-        min_loss = np.min(loss_history)
-        min_loss_epoch = loss_history.index(min_loss)
-        print(f'Minimal train loss: {min_loss:.2f} (epoch {min_loss_epoch})')
-        print(f'Final train loss: {loss_history[-1]:.2f}')
-
-        if plot_loss:
-            plt.figure(figsize=(10, 8))
-            plt.plot(list(range(len(loss_history))), loss_history)
-            plt.yscale('log')
-            plt.ylabel('Loss')
-            plt.xlabel('Epoch')
-            plt.show()
-
-    def __gradient_descent_basic(self, x_norm: nptypes.NDArray, y_norm: nptypes.NDArray,
-                                 x_test: nptypes.NDArray, y_test: nptypes.NDArray,
-                                 epochs: int, learning_rate: float | Callable, batch_size: int,
-                                 verbosity_period: int, rng: Generator) -> list[float]:
-        """
-        :return: loss values on the training dataset after every epoch
-        """
-        x_pre_norm = self.__denormalise_x(x_norm)
-        y_pre_norm = self.__denormalise_y(y_norm)
-
-        # train loss after every epoch
-        loss_history = [self.loss.val(y_pre_norm, self.predict(x_pre_norm))]
-
-        # adjusting weights & biases using backpropagation
-        for epoch in range(epochs):
-            # set the learning rate
-            if type(learning_rate) is float or type(learning_rate) is int:
-                lr = learning_rate
-            else:
-                lr = learning_rate(epoch)
-
-            # generate batches
-            x_batches, y_batches = self.__generate_batches(x_norm, y_norm, batch_size, rng)
-
-            # iterate over batches
-            for x, y in zip(x_batches, y_batches):
-                # FeedForward
-                # z - values before activation
-                # a - values after activation
-                z, a = self.__feedforward(x)
-
-                # Backpropagate
-                weights_delta, biases_delta = self.__backpropagate(y, z, a)
-
-                # updating weights
-                self.weights = [w - lr * delta / len(y)
-                                for w, delta in zip(self.weights, weights_delta)]
-                self.biases = [b - lr * delta / len(y)
-                               for b, delta in zip(self.biases, biases_delta)]
-
-            # saving loss
-            loss_history.append(self.loss.val(y_pre_norm, self.predict(x_pre_norm)))
-
-            # printing the progress
-            self.__handle_verbosity(verbosity_period=verbosity_period, epoch=epoch,
-                                    total_epochs=epochs,
-                                    x_train_pre_norm=x_pre_norm, y_train_pre_norm=y_pre_norm,
-                                    x_test=x_test, y_test=y_test)
-        return loss_history
-
-    def __gradient_descent_momentum(self, x_norm: nptypes.NDArray, y_norm: nptypes.NDArray,
-                                    x_test: nptypes.NDArray, y_test: nptypes.NDArray,
-                                    epochs: int, learning_rate: float | Callable, batch_size: int,
-                                    lambda_coef: float,
-                                    verbosity_period: int, rng: Generator) -> list[float]:
-        """
-        :return: loss values on the training dataset after every epoch
-        """
-        x_pre_norm = self.__denormalise_x(x_norm)
-        y_pre_norm = self.__denormalise_y(y_norm)
-
-        # train loss after every epoch
-        loss_history = [self.loss.val(y_pre_norm, self.predict(x_pre_norm))]
-
-        # momentum
-        momentum_weights = [np.zeros(w.shape) for w in self.weights]
-        momentum_biases = [np.zeros(b.shape) for b in self.biases]
-
-        # adjusting weights & biases using backpropagation
-        for epoch in range(epochs):
-            # set the learning rate
-            if type(learning_rate) is float or type(learning_rate) is int:
-                lr = learning_rate
-            else:
-                lr = learning_rate(epoch)
-
-            # generate batches
-            x_batches, y_batches = self.__generate_batches(x_norm, y_norm, batch_size, rng)
-
-            # iterate over batches
-            for x, y in zip(x_batches, y_batches):
-                # FeedForward
-                # z - values before activation
-                # a - values after activation
-                z, a = self.__feedforward(x)
-
-                # Backpropagate
-                weights_delta, biases_delta = self.__backpropagate(y, z, a)
-
-                # updating momentum
-                momentum_weights = [w - lambda_coef * momentum
-                                    for w, momentum in zip(weights_delta, momentum_weights)]
-                momentum_biases = [b - lambda_coef * momentum
-                                   for b, momentum in zip(biases_delta, momentum_biases)]
-                # updating weights
-                self.weights = [w - lr * momentum / len(y)
-                                for w, momentum in zip(self.weights, weights_delta)]
-                self.biases = [b - lr * momentum / len(y)
-                               for b, momentum in zip(self.biases, biases_delta)]
-
-            # saving loss
-            loss_history.append(self.loss.val(y_pre_norm, self.predict(x_pre_norm)))
-
-            # printing the progress
-            self.__handle_verbosity(verbosity_period=verbosity_period, epoch=epoch,
-                                    total_epochs=epochs,
-                                    x_train_pre_norm=x_pre_norm, y_train_pre_norm=y_pre_norm,
-                                    x_test=x_test, y_test=y_test)
-        return loss_history
-
-    def __rmsprop(self, x_norm: nptypes.NDArray, y_norm: nptypes.NDArray,
-                  x_test: nptypes.NDArray, y_test: nptypes.NDArray,
-                  epochs: int, learning_rate: float | Callable, batch_size: int, beta_coef: float,
-                  verbosity_period: int, rng: Generator) -> list[float]:
-        """
-        :return: loss values on the training dataset after every epoch
-        """
-        x_pre_norm = self.__denormalise_x(x_norm)
-        y_pre_norm = self.__denormalise_y(y_norm)
-
-        # train loss after every epoch
-        loss_history = [self.loss.val(y_pre_norm, self.predict(x_pre_norm))]
-
-        # E[g^2]
-        eg2_weights = [np.zeros(w.shape) for w in self.weights]
-        eg2_biases = [np.zeros(b.shape) for b in self.biases]
-
-        # adjusting weights & biases using backpropagation
-        for epoch in range(epochs):
-            # set the learning rate
-            if type(learning_rate) is float or type(learning_rate) is int:
-                lr = learning_rate
-            else:
-                lr = learning_rate(epoch)
-
-            # generate batches
-            x_batches, y_batches = self.__generate_batches(x_norm, y_norm, batch_size, rng)
-
-            # iterate over batches
-            for x, y in zip(x_batches, y_batches):
-                # FeedForward
-                # z - values before activation
-                # a - values after activation
-                z, a = self.__feedforward(x)
-
-                # Backpropagate
-                g_weights, g_biases = self.__backpropagate(y, z, a)
-
-                # updating E[g^2]
-                eg2_weights = [beta_coef * eg2 + (1 - beta_coef) * g ** 2
-                               for eg2, g in zip(eg2_weights, g_weights)]
-                eg2_biases = [beta_coef * eg2 + (1 - beta_coef) * g ** 2
-                              for eg2, g in zip(eg2_biases, g_biases)]
-
-                # updating weights
-                self.weights = [w - lr * (g / np.sqrt(eg2)) / len(y)
-                                for w, g, eg2 in zip(self.weights, g_weights, eg2_weights)]
-                self.biases = [b - lr * (g / np.sqrt(eg2)) / len(y)
-                               for b, g, eg2 in zip(self.biases, g_biases, eg2_biases)]
-
-            # saving loss
-            loss_history.append(self.loss.val(y_pre_norm, self.predict(x_pre_norm)))
-
-            # printing the progress
-            self.__handle_verbosity(verbosity_period=verbosity_period, epoch=epoch,
-                                    total_epochs=epochs,
-                                    x_train_pre_norm=x_pre_norm, y_train_pre_norm=y_pre_norm,
-                                    x_test=x_test, y_test=y_test)
-        return loss_history
-
-    def train(self, x_train: nptypes.NDArray, y_train: nptypes.NDArray,
-              x_test: nptypes.NDArray = None, y_test: nptypes.NDArray = None, method='basic',
-              epochs: int = 1000, learning_rate: float | Callable = 0.001,
-              batch_size: int = 1, momentum_coef: float = 0.9, rmsprop_coef: float = 0.9,
-              plot_loss: bool = False, random_state: int | None = None,
+    def train(self, x_train: NDArray, y_train: NDArray, epochs: int,
+              x_test: NDArray = None, y_test: NDArray = None,
+              batch_size: int = 32,
+              learning_rate: float | Callable = 0.001,
+              optimiser: Optimiser = None,
+              weights_init_method: str = None,
+              plot_metric: bool = False,
+              random_state: int | None = None,
               verbosity_period: int = 0) -> list[float]:
         """
         Attempts to find optimal weights & biases for the network
 
-        :param method:                 a method used to find the optimal weights. Accepted values: 'basic' (basic gradient descent),
-                                       'momentum' (gradient descent with momentum), 'rmsprop'.
-        :param learning_rate:          a learning rate coefficient. Can be either a number or a function that takes the epoch
-                                       number as an argument and returns a float
-        :param momentum_coef:          a lambda coefficient for the gradient descent with momentum algorithm. Ignored unless the method
-                                       parameter is set to 'momentum'
-        :param rmsprop_coef:           a beta coefficient for the RMSProp algorithm. Ignored unless the method parameter is set to 'rmsprop'
-        :param random_state:           a seed passed to a random number generation (affects the randomness of generating batches and
-                                       setting initial weights & biases)
-        :param plot_loss:              whether to plot loss function values per epoch after the training
-        :param verbosity_period:       controls how often loss values are printed. If verbosity_period = n, then the progress will be printed
-                                       every nth epoch. If verbosity_period = 0, then nothing will be printed.
+        :param x_train:                data used for training
+        :param y_train:                target variable values used for training
+        :param epochs:                 maximum number of epoch after which the training process
+                                       will stop
+        :param x_test:                 data used for test evalutaion
+        :param y_test:                 target variable values used for test evalutaion
+        :param batch_size:             a batch size used for training (how many times to perform
+                                       backpropagations before updating weights)
+        :param optimiser:              an optimiser used to update weights
+        :param weights_init_method:    a method to use to initialise weights. Possible values:
+                                       "default", "xavier", "he". If set to None, the method
+                                       will be inferred from the used activation function ("he" for
+                                       ReLU, "xavier" for sigmoid or tanh, "default" otherwise)
+        :param learning_rate:          a learning rate coefficient. Can be either a number or a
+                                       function that takes the epoch number as an argument and
+                                       returns a float
+        :param random_state:           a seed passed to a random number generation (affects the
+                                       randomness of generating batches and setting initial
+                                       weights & biases)
+        :param plot_metric:            whether to plot metric function values per epoch after
+                                       the training
+        :param verbosity_period:       controls how often loss values are printed. If
+                                       verbosity_period = n, then the progress will be printed
+                                       every nth epoch. If verbosity_period = 0, then nothing
+                                       will be printed.
 
-        :return:                       loss values after every epoch
+        :return:                       loss values on train dataset after every epoch
         """
+        # default optimiser
+        if optimiser is None:
+            optimiser = MomentumGD()
+
         # random_state for reproducibility
-        rng = self.__get_rng(random_state)
+        rng = _get_rng(random_state)
 
         # reset weights
-        self.__set_default_weights(rng)
+        self.__set_default_weights(rng=rng, method=weights_init_method)
 
         # normalisation
         self.__normalise_max_x = np.max(x_train)
@@ -398,38 +290,68 @@ class MLP:
         x_norm = self.__normalise_x(x_train)
         y_norm = self.__normalise_y(y_train)
 
-        # finding the best weights & biases
-        if method == 'basic':
-            loss_history = self.__gradient_descent_basic(
-                x_norm=x_norm, y_norm=y_norm, x_test=x_test, y_test=y_test,
-                epochs=epochs, learning_rate=learning_rate,
-                batch_size=batch_size,
-                verbosity_period=verbosity_period, rng=rng,
-            )
-        elif method == 'momentum':
-            loss_history = self.__gradient_descent_momentum(
-                x_norm=x_norm, y_norm=y_norm, x_test=x_test, y_test=y_test,
-                epochs=epochs, learning_rate=learning_rate,
-                batch_size=batch_size, lambda_coef=momentum_coef,
-                verbosity_period=verbosity_period, rng=rng,
-            )
-        elif method == 'rmsprop':
-            loss_history = self.__rmsprop(
-                x_norm=x_norm, y_norm=y_norm, x_test=x_test, y_test=y_test,
-                epochs=epochs, learning_rate=learning_rate,
-                batch_size=batch_size, beta_coef=rmsprop_coef,
-                verbosity_period=verbosity_period, rng=rng,
-            )
-        else:
-            raise ValueError(
-                'Wrong value for the method parameter. Possible values: "basic", "momentum", "rmsprop"')
+        # metric value after every epoch
+        metric_history_train = [self.eval_metric(y_train, self.predict(x_train))]
 
+        # min loss
+        min_loss = self.loss.val(y_train, self.predict(x_train))
+        min_loss_epoch = 0
+
+        # adjusting weights & biases using backpropagation
+        for epoch in range(epochs):
+            # set the learning rate
+            if type(learning_rate) is float or type(learning_rate) is int:
+                lr = learning_rate
+            else:
+                lr = learning_rate(epoch)
+
+            # generate batches
+            x_batches, y_batches = _generate_batches(x_norm, y_norm, batch_size, rng)
+
+            # iterate over batches
+            for x, y in zip(x_batches, y_batches):
+                # FeedForward
+                # z - values before activation
+                # a - values after activation
+                z, a = self.__feedforward(x)
+
+                # Backpropagate
+                weights_delta, biases_delta = self.__backpropagate(y, z, a)
+
+                # updating weights
+                self.weights, self.biases = optimiser.get_new_weights(
+                    curr_weights=self.weights, curr_biases=self.biases,
+                    learning_rate=lr, batch_size=len(y),
+                    weights_delta=weights_delta, biases_delta=biases_delta
+                )
+
+            # saving loss
+            metric_history_train.append(self.eval_metric(y_train, self.predict(x_train)))
+
+            # checking if the loss has dropped
+            curr_loss = self.loss.val(y_train, self.predict(x_train))
+            if curr_loss < min_loss:
+                min_loss = curr_loss
+                min_loss_epoch = epoch + 1
+
+            # printing the progress
+            self.__handle_verbosity(verbosity_period=verbosity_period, epoch=epoch,
+                                    total_epochs=epochs,
+                                    x_train_pre_norm=x_train, y_train_pre_norm=y_train,
+                                    x_test=x_test, y_test=y_test)
         # summary
-        self.__summarise_training(loss_history, plot_loss)
-        return loss_history
+        print(f'Min loss on epoch {min_loss_epoch} (metric: {metric_history_train[min_loss_epoch]:.2f})')
+        print(f'Final train metric value: {metric_history_train[-1]:.2f}')
 
-    def predict(self, x: nptypes.NDArray,
-                convert_prob_to_labels: bool = False) -> nptypes.NDArray:
+        if plot_metric:
+            plt.plot(list(range(len(metric_history_train))), metric_history_train)
+            plt.yscale('log')
+            plt.ylabel('Evaluation metric value')
+            plt.xlabel('Epoch')
+            plt.show()
+        return metric_history_train
+
+    def predict(self, x: NDArray, convert_prob_to_labels: bool = False) -> NDArray:
         # normalisation
         x = self.__normalise_x(x)
 
