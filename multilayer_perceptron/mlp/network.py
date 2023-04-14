@@ -1,4 +1,4 @@
-from typing import Callable
+from typing import Callable, Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -38,12 +38,12 @@ def _generate_batches(x: NDArray, y: NDArray, batch_size: int,
 
 class MLP:
     __slots__ = ['input_size', 'output_size', 'hidden_layers_sizes', 'weights', 'biases',
-                 'activation_func', 'out_func', 'loss', 'eval_metric',
+                 'activation_func', 'out_func', 'loss', 
                  '__normalise_max_x', '__normalise_min_x', '__normalise_max_y', '__normalise_min_y']
 
     def __init__(self, input_size: int, hidden_layers_sizes: list[int], output_size: int,
                  activation_func: ActivationFunction, out_func: ActivationFunction,
-                 loss: LossFunction, eval_metric: Callable = None, weights_init_method: str = None):
+                 loss: LossFunction, weights_init_method: Literal['default', 'xavier', 'he'] = None):
         """
         :param input_size:          dimension of the input
         :param hidden_layers_sizes: sizes of the hidden layers passed as a list (e.g. [10, 10])
@@ -51,7 +51,6 @@ class MLP:
         :param activation_func:     activation function for all the layers except the last one
         :param out_func:            activation function for the last layer
         :param loss:                a loss function optimised during training
-        :param eval_metric:         a metric used to evaluate the model
         :param weights_init_method: a method to use to initialise weights. Possible values:
                                     "default", "xavier", "he". Default means the weights will be
                                     initialised from the uniform distribution on a [0, 1] interval.
@@ -65,10 +64,6 @@ class MLP:
         self.activation_func = activation_func
         self.out_func = out_func
         self.loss = loss
-        # default eval metric will be a loss function
-        if eval_metric is None:
-            eval_metric = loss.val
-        self.eval_metric = eval_metric
 
         self.weights = []
         self.biases = []
@@ -87,21 +82,20 @@ class MLP:
         if rng is None:
             rng = Generator(PCG64())
         if method is None:
-            if self.activation_func is ReLUActivation:
+            if type(self.activation_func) == ReLUActivation:
                 method = 'he'
-            elif self.activation_func is SigmoidActivation or \
-                    self.activation_func is TanhActivation:
+            elif type(self.activation_func) == SigmoidActivation or \
+                    type(self.activation_func) == TanhActivation:
                 method = 'xavier'
             else:
                 method = 'default'
 
-        # default weigths are taken from normal distribution
         layers_sizes = [self.input_size, *self.hidden_layers_sizes, self.output_size]
         for i in range(len(layers_sizes) - 1):
             shape = (layers_sizes[i], layers_sizes[i + 1])
 
             if method == 'xavier':
-                xavier_boundary = 1 / np.sqrt(shape[0])
+                xavier_boundary = 6 / np.sqrt(shape[0] + shape[1])
                 new_weights = rng.uniform(low=-xavier_boundary, high=xavier_boundary, size=shape)
             elif method == 'he':
                 new_weights = rng.normal(scale=np.sqrt(2 / shape[0]), size=shape)
@@ -111,7 +105,7 @@ class MLP:
 
             self.weights.append(new_weights)
 
-        # default biases are 0
+        # default biases are 0 by default
         for layer_size in layers_sizes[1:]:
             self.biases.append(
                 np.zeros((1, layer_size))
@@ -175,13 +169,13 @@ class MLP:
         # unless verbosity_period is set to 0
         if verbosity_period > 0 and (epoch + 1) % verbosity_period == 0:
 
-            metric_train = self.eval_metric(y_train_pre_norm, self.predict(x_train_pre_norm))
+            loss_train = self.loss.val(y_train_pre_norm, self.predict(x_train_pre_norm))
             text = f'Epoch {epoch + 1}/{total_epochs} done | ' \
-                   f'eval_metric(train) = {metric_train:.2f}'
+                   f'loss(train) = {loss_train:.3f}'
 
             if x_test is not None and y_test is not None:
-                metric_test = self.eval_metric(y_test, self.predict(x_test))
-                text += f' | eval_metric(test) = {metric_test:.2f}'
+                loss_test = self.loss.val(y_test, self.predict(x_test))
+                text += f' | loss(test) = {loss_test:.3f}'
             print(text)
 
     def __feedforward(self, x: NDArray) -> tuple[list[NDArray], list[NDArray]]:
@@ -238,9 +232,11 @@ class MLP:
               learning_rate: float | Callable = 0.001,
               optimiser: Optimiser = None,
               weights_init_method: str = None,
-              plot_metric: bool = False,
+              plot_loss: bool = False,
               random_state: int | None = None,
-              verbosity_period: int = 0) -> list[float]:
+              verbosity_period: int = 0,
+              l2_coef: float = 0,
+              stop_on_test_loss_rise = False) -> tuple[list[float], list[float]]:
         """
         Attempts to find optimal weights & biases for the network
 
@@ -263,14 +259,21 @@ class MLP:
         :param random_state:           a seed passed to a random number generation (affects the
                                        randomness of generating batches and setting initial
                                        weights & biases)
-        :param plot_metric:            whether to plot metric function values per epoch after
+        :param plot_loss:              whether to plot loss function values per epoch after
                                        the training
         :param verbosity_period:       controls how often loss values are printed. If
                                        verbosity_period = n, then the progress will be printed
                                        every nth epoch. If verbosity_period = 0, then nothing
-                                       will be printed.
+                                       will be printed
+        :param l2_coef:                lambda coefficient for L2 regularisation. Set to 0 for
+                                       no regularisation
+        :param stop_on_test_loss_rise: whether to stop the training process when the loss value on a 
+                                       test dataset gets doubled compared to the previous epoch
 
-        :return:                       loss values on train dataset after every epoch
+        :return:                       a tuple containing two lists with loss values after every epoch,
+                                       the first one contains loss values on a train data and the
+                                       second one contains loss values on the test data. The second
+                                       list will be empty if no test data has been provided.
         """
         # default optimiser
         if optimiser is None:
@@ -290,15 +293,21 @@ class MLP:
         x_norm = self.__normalise_x(x_train)
         y_norm = self.__normalise_y(y_train)
 
-        # metric value after every epoch
-        metric_history_train = [self.eval_metric(y_train, self.predict(x_train))]
+        # to avoid code repetition
+        is_test_data_provided = x_test is not None and y_test is not None
 
-        # min loss
-        min_loss = self.loss.val(y_train, self.predict(x_train))
-        min_loss_epoch = 0
+        # train loss after every epoch
+        loss_history_train = [self.loss.val(y_train, self.predict(x_train))]
+        loss_history_test = []
+        if is_test_data_provided:
+            loss_history_test.append(self.loss.val(y_test, self.predict(x_test)))
 
         # adjusting weights & biases using backpropagation
         for epoch in range(epochs):
+            # save weights from the start of the epoch
+            weights_epoch_start = self.weights
+            biases_epoch_start = self.biases
+
             # set the learning rate
             if type(learning_rate) is float or type(learning_rate) is int:
                 lr = learning_rate
@@ -318,21 +327,31 @@ class MLP:
                 # Backpropagate
                 weights_delta, biases_delta = self.__backpropagate(y, z, a)
 
+                # Regularisation
+                if l2_coef != 0:
+                    weights_delta = [l2_coef * old_w + new_w for old_w, new_w in zip(self.weights, weights_delta)]
+
                 # updating weights
                 self.weights, self.biases = optimiser.get_new_weights(
                     curr_weights=self.weights, curr_biases=self.biases,
                     learning_rate=lr, batch_size=len(y),
                     weights_delta=weights_delta, biases_delta=biases_delta
                 )
+            
+            # stop the training if test loss value gets too high
+            if stop_on_test_loss_rise and is_test_data_provided:
+                curr_test_loss = self.loss.val(y_test, self.predict(x_test))
+                prev_test_loss = loss_history_test[-1]
+                if curr_test_loss > 2 * prev_test_loss:
+                    self.weights = weights_epoch_start
+                    self.biases = biases_epoch_start
+                    print(f'Test loss too high (new loss: {curr_test_loss:.2f}; old loss: {prev_test_loss:.2f}) - stopping the training')
+                    break
 
             # saving loss
-            metric_history_train.append(self.eval_metric(y_train, self.predict(x_train)))
-
-            # checking if the loss has dropped
-            curr_loss = self.loss.val(y_train, self.predict(x_train))
-            if curr_loss < min_loss:
-                min_loss = curr_loss
-                min_loss_epoch = epoch + 1
+            loss_history_train.append(self.loss.val(y_train, self.predict(x_train)))
+            if is_test_data_provided:
+                loss_history_test.append(self.loss.val(y_test, self.predict(x_test)))
 
             # printing the progress
             self.__handle_verbosity(verbosity_period=verbosity_period, epoch=epoch,
@@ -340,16 +359,18 @@ class MLP:
                                     x_train_pre_norm=x_train, y_train_pre_norm=y_train,
                                     x_test=x_test, y_test=y_test)
         # summary
-        print(f'Min loss on epoch {min_loss_epoch} (metric: {metric_history_train[min_loss_epoch]:.2f})')
-        print(f'Final train metric value: {metric_history_train[-1]:.2f}')
+        min_loss_epoch = np.argmin(loss_history_train)
+        min_loss = loss_history_train[min_loss_epoch]
+        print(f'Min train loss: {min_loss:.3f} (epoch {min_loss_epoch})')
+        print(f'Final train metric value: {loss_history_train[-1]:.3f}')
 
-        if plot_metric:
-            plt.plot(list(range(len(metric_history_train))), metric_history_train)
+        if plot_loss:               
+            plt.plot(list(range(len(loss_history_train))), loss_history_train)
             plt.yscale('log')
-            plt.ylabel('Evaluation metric value')
+            plt.ylabel('Train loss value')
             plt.xlabel('Epoch')
             plt.show()
-        return metric_history_train
+        return loss_history_train, loss_history_test
 
     def predict(self, x: NDArray, convert_prob_to_labels: bool = False) -> NDArray:
         # normalisation
