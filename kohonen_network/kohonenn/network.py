@@ -22,7 +22,7 @@ class KohonenNetwork:
             self.__normalise_min = np.min(data)
         return (data - self.__normalise_min) / (self.__normalise_max - self.__normalise_min)
 
-    def __reset_weights(self, random_state: int = None):
+    def __reset_weights(self, low: float = 0, high: float = 1, random_state: int = None):
         """
         self.weights[:, :, i] - weights for the i-th input
         self.weights[i][j] - weights for the (i, j)-th neuron
@@ -34,7 +34,9 @@ class KohonenNetwork:
         self.__rng = rng
 
         self.weights = self.__rng.uniform(
-            size=(self.output_dim[0], self.output_dim[1], self.input_size))
+            low=low, high=high,
+            size=(self.output_dim[0], self.output_dim[1], self.input_size)
+        )
 
     def __shuffled_vector(self, v: np.ndarray) -> np.ndarray:
         """Returns a shuffled copy of a given vector"""
@@ -73,10 +75,7 @@ class KohonenNetwork:
                                     will be printed
         :param random_state:        controls the randomness of initial weights
         """
-        self.__reset_weights(random_state)
-
-        # scale the input data to [0, 1]
-        data_norm = self.__normalise_input(data, reset_norm_coefs=True)
+        self.__reset_weights(np.min(data), np.max(data), random_state)
 
         # distance function
         dist = neighbourhood_func.distance_func
@@ -86,17 +85,17 @@ class KohonenNetwork:
             epoch += 1
             deltas_abs = []
 
-            for x in self.__shuffled_vector(data_norm):
+            for x in self.__shuffled_vector(data):
                 weights_dists = [dist(self.weights[i][j], x)
                                  for i in range(self.output_dim[0])
                                  for j in range(self.output_dim[1])]
-                bmu_dist = np.argmin(weights_dists)
-                bmu_idx = np.array(np.unravel_index(bmu_dist, self.output_dim))
+                bmu_idx = np.argmin(weights_dists)
+                bmu_coords = np.array(np.unravel_index(bmu_idx, self.output_dim))
 
                 for i in range(self.output_dim[0]):
                     for j in range(self.output_dim[1]):
                         delta = \
-                            neighbourhood_func.val(bmu_idx, np.array([i, j]), epoch) * \
+                            neighbourhood_func.val(bmu_coords, np.array([i, j]), epoch) * \
                             lr_decay_func(init_lr, epoch, epochs) * \
                             (x - self.weights[i][j])
                         self.weights[i][j] += delta
@@ -112,10 +111,7 @@ class KohonenNetwork:
                 print(text)
 
     def predict(self, data: np.ndarray) -> np.ndarray:
-        # scale input to [0, 1]
-        data_norm = self.__normalise_input(data)
-
-        activations = np.dot(self.weights, data_norm.T)
+        activations = np.dot(self.weights, data.T)
         # flatten activations
         activations = activations.reshape(-1, activations.shape[-1])
 
