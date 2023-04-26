@@ -54,7 +54,16 @@ class KohonenNetwork:
             plt.ylabel('x2 weights')
             plt.title('Neuron weights')
             return fig
-        print('Currently only supported for 2-dimensional input ;(')
+        elif self.input_size == 3:
+            x = self.weights[:, :, 0].reshape(1, -1)
+            y = self.weights[:, :, 1].reshape(1, -1)
+            z = self.weights[:, :, 2].reshape(1, -1)
+            fig = plt.figure()
+            ax = fig.add_subplot(projection='3d')
+            ax.scatter(x, y, z)
+            plt.title('Neuron weights')
+            return fig
+        print('Only supported for two- and three-dimensional input')
         return
 
     def train(self, data: np.ndarray, epochs: int, init_lr: float, lr_decay_func: Callable,
@@ -75,7 +84,7 @@ class KohonenNetwork:
                                     will be printed
         :param random_state:        controls the randomness of initial weights
         """
-        self.__reset_weights(np.min(data), np.max(data), random_state)
+        self.__reset_weights(np.min(data) * 1.1, np.max(data) * 1.1, random_state)
 
         # distance function
         dist = neighbourhood_func.distance_func
