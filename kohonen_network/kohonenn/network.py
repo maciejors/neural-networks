@@ -5,6 +5,7 @@ from numpy.random import Generator, PCG64
 import matplotlib.pyplot as plt
 
 from .neighbourhood_func import NeighbourhoodFunction
+from .distance_metrics import euclidean_dist
 
 
 class KohonenNetwork:
@@ -44,25 +45,24 @@ class KohonenNetwork:
         self.__rng.shuffle(indices)
         return v[indices]
 
-    def visualise_weights(self, size: int = None) -> plt.Figure | None:
+    def visualise_weights(self, size: int = None, fig: plt.Figure = None, ax: plt.Axes = None):
+        if fig is None:
+            fig = plt.figure()
         if self.input_size == 2:
             x = self.weights[:, :, 0].reshape(1, -1)
             y = self.weights[:, :, 1].reshape(1, -1)
-            fig = plt.figure()
-            plt.scatter(x, y, s=size)
-            plt.xlabel('x1 weights')
-            plt.ylabel('x2 weights')
-            plt.title('Neuron weights')
-            return fig
+            plt.scatter(x, y, s=size, marker='x', color='red')
+            return
         elif self.input_size == 3:
+            if ax is None:
+                ax = fig.add_subplot(projection='3d')
+            if size is None:
+                size = 100
             x = self.weights[:, :, 0].reshape(1, -1)
             y = self.weights[:, :, 1].reshape(1, -1)
             z = self.weights[:, :, 2].reshape(1, -1)
-            fig = plt.figure()
-            ax = fig.add_subplot(projection='3d')
-            ax.scatter(x, y, z)
-            plt.title('Neuron weights')
-            return fig
+            ax.scatter(x, y, z, marker='x', s=size, color='red')
+            return
         print('Only supported for two- and three-dimensional input')
         return
 
@@ -120,10 +120,11 @@ class KohonenNetwork:
                 print(text)
 
     def predict(self, data: np.ndarray) -> np.ndarray:
-        activations = np.dot(self.weights, data.T)
-        # flatten activations
-        activations = activations.reshape(-1, activations.shape[-1])
-
-        # find cluster labels for each input observation
-        labels = np.argmax(activations, axis=0)
+        labels = []
+        for x in data:
+            weights_dists = [euclidean_dist(self.weights[i][j], x)
+                             for i in range(self.output_dim[0])
+                             for j in range(self.output_dim[1])]
+            bmu_idx = np.argmin(weights_dists)
+            labels.append(bmu_idx)
         return labels

@@ -32,5 +32,4 @@ class MexicanHat(NeighbourhoodFunction):
 
     def val(self, x: np.ndarray, y: np.ndarray, t: int) -> np.ndarray:
         d = self.nbhood_width_factor * self.distance_func(x, y)
-        # return (2 - 4 * t**2 * d**2) * t**2 * np.exp(-t**2 * d**2)
-        return (2 - 4 * (d * t)**2) * np.exp(-(d * t)**2)
+        return (2 - 4 * (d)**2) * np.exp(-(d * t)**2)
