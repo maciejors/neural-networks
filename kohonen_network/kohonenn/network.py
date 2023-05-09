@@ -3,31 +3,28 @@ from typing import Callable
 import numpy as np
 from numpy.random import Generator, PCG64
 import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
 
 from .neighbourhood_func import NeighbourhoodFunction
-from .distance_metrics import euclidean_dist
+from .distance import distance
 
 
 class KohonenNetwork:
-    __slots__ = ['input_size', 'output_dim', 'weights', '__rng',
+    __slots__ = ['input_size', 'output_dim', 'weights', 'hex_topology', '__rng',
                  '__normalise_min', '__normalise_max']
 
-    def __init__(self, input_size: int, output_dim: tuple[int, int]):
+    def __init__(self, input_size: int, output_dim: tuple[int, int],
+                 hex_topology: bool = False):
         self.input_size = input_size
         self.output_dim = output_dim
+        self.hex_topology = hex_topology
         self.__reset_weights()
 
-    def __normalise_input(self, data: np.ndarray, reset_norm_coefs=False) -> np.ndarray:
-        if reset_norm_coefs:
-            self.__normalise_max = np.max(data)
-            self.__normalise_min = np.min(data)
-        return (data - self.__normalise_min) / (self.__normalise_max - self.__normalise_min)
+    @property
+    def neurons_count(self) -> int:
+        return self.output_dim[0] * self.output_dim[1]
 
     def __reset_weights(self, low: float = 0, high: float = 1, random_state: int = None):
-        """
-        self.weights[:, :, i] - weights for the i-th input
-        self.weights[i][j] - weights for the (i, j)-th neuron
-        """
         if random_state is None:
             rng = Generator(PCG64())
         else:
@@ -36,7 +33,7 @@ class KohonenNetwork:
 
         self.weights = self.__rng.uniform(
             low=low, high=high,
-            size=(self.output_dim[0], self.output_dim[1], self.input_size)
+            size=(self.neurons_count, self.input_size)
         )
 
     def __shuffled_vector(self, v: np.ndarray) -> np.ndarray:
@@ -45,26 +42,53 @@ class KohonenNetwork:
         self.__rng.shuffle(indices)
         return v[indices]
 
-    def visualise_weights(self, size: int = None, fig: plt.Figure = None, ax: plt.Axes = None):
+    def visualise_centroids(self, data: np.ndarray, fig: plt.Figure = None):
         if fig is None:
             fig = plt.figure()
+
+        # handle multi-dimensional input data
         if self.input_size == 2:
-            x = self.weights[:, :, 0].reshape(1, -1)
-            y = self.weights[:, :, 1].reshape(1, -1)
-            plt.scatter(x, y, s=size, marker='x', color='red')
-            return
-        elif self.input_size == 3:
-            if ax is None:
-                ax = fig.add_subplot(projection='3d')
-            if size is None:
-                size = 100
-            x = self.weights[:, :, 0].reshape(1, -1)
-            y = self.weights[:, :, 1].reshape(1, -1)
-            z = self.weights[:, :, 2].reshape(1, -1)
-            ax.scatter(x, y, z, marker='x', s=size, color='red')
-            return
-        print('Only supported for two- and three-dimensional input')
-        return
+            data_x = data[:, 0].reshape(1, -1)
+            data_y = data[:, 1].reshape(1, -1)
+            weights_x = self.weights[:, 0].reshape(1, -1)
+            weights_y = self.weights[:, 1].reshape(1, -1)
+        else:
+            dim_reducer = TSNE(n_components=2)
+            data_and_weights = np.concatenate([self.weights, data])
+            data_and_weights_2d = dim_reducer.fit_transform(data_and_weights)
+
+            data_x = data_and_weights_2d[self.neurons_count:, 0].reshape(1, -1)
+            data_y = data_and_weights_2d[self.neurons_count:, 1].reshape(1, -1)
+            weights_x = data_and_weights_2d[:self.neurons_count, 0].reshape(1, -1)
+            weights_y = data_and_weights_2d[:self.neurons_count, 1].reshape(1, -1)
+
+        # plotting data
+        plt.scatter(data_x, data_y, c=self.predict(data))
+
+        # centroid marker properties
+        marker_type = 'x'
+        size_outer = 140
+        size_inner = 100
+        colour_outer = 'black'
+        colour_inner = 'white'
+        width_outer = 4
+        width_inner = 1.5
+
+        # plotting centroids
+        plt.scatter(
+            weights_x, weights_y, 
+            s=size_outer, 
+            marker=marker_type, 
+            color=colour_outer, 
+            linewidths=width_outer,
+        )
+        plt.scatter(
+            weights_x, weights_y, 
+            s=size_inner, 
+            marker=marker_type, 
+            color=colour_inner, 
+            linewidths=width_inner,
+        )
 
     def train(self, data: np.ndarray, epochs: int, init_lr: float, lr_decay_func: Callable,
               neighbourhood_func: NeighbourhoodFunction, verbosity_period: int = 0,
@@ -86,31 +110,35 @@ class KohonenNetwork:
         """
         self.__reset_weights(np.min(data) * 1.1, np.max(data) * 1.1, random_state)
 
-        # distance function
-        dist = neighbourhood_func.distance_func
-
         for epoch in range(epochs):
             # epochs start from 1
             epoch += 1
             deltas_abs = []
 
             for x in self.__shuffled_vector(data):
-                weights_dists = [dist(self.weights[i][j], x)
-                                 for i in range(self.output_dim[0])
-                                 for j in range(self.output_dim[1])]
+                weights_dists = [distance(self.weights[i], x)
+                                 for i in range(self.neurons_count)]
                 bmu_idx = np.argmin(weights_dists)
                 bmu_coords = np.array(np.unravel_index(bmu_idx, self.output_dim))
 
-                for i in range(self.output_dim[0]):
-                    for j in range(self.output_dim[1]):
-                        delta = \
-                            neighbourhood_func.val(bmu_coords, np.array([i, j]), epoch) * \
-                            lr_decay_func(init_lr, epoch, epochs) * \
-                            (x - self.weights[i][j])
-                        self.weights[i][j] += delta
-                        # for epoch statistics
-                        if verbosity_period > 0:
-                            deltas_abs.append(np.abs(delta))
+                for i in range(self.neurons_count):
+                    # convert i to topological coordinates
+                    curr_coords = np.array(np.unravel_index(i, self.output_dim))
+                    # calculate distance to bmu
+                    bmu_dist = distance(
+                        bmu_coords, curr_coords,
+                        a_to_hex=self.hex_topology,
+                        b_to_hex=self.hex_topology,
+                    )
+                    # calculate weights delta
+                    delta = \
+                        neighbourhood_func.val(bmu_dist, epoch) * \
+                        lr_decay_func(init_lr, epoch, epochs) * \
+                        (x - self.weights[i])
+                    self.weights[i] += delta
+                    # for epoch statistics
+                    if verbosity_period > 0 and epoch % verbosity_period == 0:
+                        deltas_abs.append(np.abs(delta))
 
             if verbosity_period > 0 and epoch % verbosity_period == 0:
                 text = f'Epoch {epoch} done!\n' \
@@ -122,9 +150,8 @@ class KohonenNetwork:
     def predict(self, data: np.ndarray) -> np.ndarray:
         labels = []
         for x in data:
-            weights_dists = [euclidean_dist(self.weights[i][j], x)
-                             for i in range(self.output_dim[0])
-                             for j in range(self.output_dim[1])]
+            weights_dists = [distance(self.weights[i], x)
+                             for i in range(self.neurons_count)]
             bmu_idx = np.argmin(weights_dists)
             labels.append(bmu_idx)
-        return labels
+        return np.array(labels)
