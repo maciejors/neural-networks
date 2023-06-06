@@ -67,7 +67,7 @@ class MLP:
 
         self.weights = []
         self.biases = []
-        self.__set_default_weights(method=weights_init_method)
+        self.set_default_weights(method=weights_init_method)
 
         # default normalisation values mean 'no normalisation':
         self.__normalise_min_x = 0
@@ -75,7 +75,7 @@ class MLP:
         self.__normalise_min_y = 0
         self.__normalise_max_y = 1
 
-    def __set_default_weights(self, method: str = None, rng: Generator = None):
+    def set_default_weights(self, method: str = None, rng: Generator = None):
         self.weights = []
         self.biases = []
 
@@ -149,6 +149,12 @@ class MLP:
                 plot_title = f'{i} -> Output'
             plt.title(plot_title)
         plt.show()
+
+    def set_normalisation(self, x: np.ndarray, y: np.ndarray):
+        self.__normalise_max_x = np.max(x)
+        self.__normalise_min_x = np.min(x)
+        self.__normalise_max_y = np.max(y)
+        self.__normalise_min_y = np.min(y)
 
     def __normalise_x(self, x: NDArray) -> NDArray:
         return (x - self.__normalise_min_x) / (self.__normalise_max_x - self.__normalise_min_x)
@@ -283,13 +289,10 @@ class MLP:
         rng = _get_rng(random_state)
 
         # reset weights
-        self.__set_default_weights(rng=rng, method=weights_init_method)
+        self.set_default_weights(rng=rng, method=weights_init_method)
 
         # normalisation
-        self.__normalise_max_x = np.max(x_train)
-        self.__normalise_min_x = np.min(x_train)
-        self.__normalise_max_y = np.max(y_train)
-        self.__normalise_min_y = np.min(y_train)
+        self.set_normalisation(x_train, y_train)
         x_norm = self.__normalise_x(x_train)
         y_norm = self.__normalise_y(y_train)
 
